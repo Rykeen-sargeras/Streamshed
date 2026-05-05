@@ -258,10 +258,8 @@ app.get("/api/events", async (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
-  res.write("event: connected
-data: " + JSON.stringify({ ok: true }) + "
-
-");
+  const nl = String.fromCharCode(10);
+  res.write("event: connected" + nl + "data: " + JSON.stringify({ ok: true }) + nl + nl);
   clients.add(res);
   req.on("close", () => clients.delete(res));
 });
@@ -397,7 +395,7 @@ app.get("/", (req, res) => {
   res.type("html").send(INDEX_HTML);
 });
 
-const INDEX_HTML = String.raw`<!DOCTYPE html>
+const INDEX_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
