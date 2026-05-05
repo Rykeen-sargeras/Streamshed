@@ -403,7 +403,7 @@ const INDEX_HTML = `<!DOCTYPE html>
 <title>Streamshed Schedule</title>
 <style>
 :root{--bg:#09090f;--card:#151522;--card2:#202033;--text:#f8f8fb;--muted:#b8b8ca;--red:#ff2d2d;--green:#2be282;--yellow:#ffd166;--blue:#69a7ff;--border:rgba(255,255,255,.12)}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#23233a,#09090f 45%);color:var(--text);font-family:Arial,Helvetica,sans-serif}button,input,textarea,select{font:inherit}button{cursor:pointer;border:0;border-radius:12px;padding:10px 14px;font-weight:800;background:var(--red);color:#fff}button.secondary{background:var(--card2)}button.good{background:var(--green);color:#051009}button.warn{background:var(--yellow);color:#1d1400}button.blue{background:var(--blue);color:#06101d}input,textarea,select{width:100%;padding:12px;border-radius:12px;border:1px solid var(--border);background:#0e0e18;color:var(--text)}label{font-size:13px;color:var(--muted);font-weight:800}.wrap{max-width:1180px;margin:0 auto;padding:22px}.hero{display:flex;gap:18px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:18px}.title h1{font-size:clamp(30px,5vw,58px);margin:0;letter-spacing:-2px}.title p{color:var(--muted);margin:8px 0 0}.pill{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border:1px solid var(--border);border-radius:999px;background:rgba(255,255,255,.06);color:var(--muted);font-weight:800}.dot{width:10px;height:10px;border-radius:50%;background:var(--green);box-shadow:0 0 16px var(--green)}.grid{display:grid;grid-template-columns:1.1fr .9fr;gap:18px}.panel{background:rgba(21,21,34,.92);border:1px solid var(--border);border-radius:22px;padding:18px;box-shadow:0 18px 50px rgba(0,0,0,.35)}.tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}.tab{background:var(--card2);color:var(--muted)}.tab.active{background:var(--red);color:white}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.stack{display:grid;gap:12px}.stream{display:grid;grid-template-columns:140px 1fr;gap:14px;background:#10101b;border:1px solid var(--border);border-radius:18px;padding:12px;margin-bottom:12px}.thumb{width:140px;aspect-ratio:16/9;border-radius:14px;background:#27273a;object-fit:cover}.badge{display:inline-block;padding:6px 10px;border-radius:999px;font-size:12px;font-weight:900;text-transform:uppercase}.live{background:var(--green);color:#061209}.upcoming{background:var(--blue);color:#06101d}.pending{background:var(--yellow);color:#211600}.rejected,.ended{background:#555;color:white}.meta{color:var(--muted);font-size:14px}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.hidden{display:none!important}.mini{font-size:12px;color:var(--muted)}.notice{padding:12px;border-radius:14px;border:1px solid var(--border);background:rgba(255,255,255,.05);color:var(--muted)}.adminOnly{border-color:rgba(255,45,45,.35)}@media(max-width:900px){.grid{grid-template-columns:1fr}.stream{grid-template-columns:1fr}.thumb{width:100%}.row{grid-template-columns:1fr}}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#23233a,#09090f 45%);color:var(--text);font-family:Arial,Helvetica,sans-serif}button,input,textarea,select{font:inherit}button{cursor:pointer;border:0;border-radius:12px;padding:10px 14px;font-weight:800;background:var(--red);color:#fff}button.secondary{background:var(--card2)}button.good{background:var(--green);color:#051009}button.warn{background:var(--yellow);color:#1d1400}button.blue{background:var(--blue);color:#06101d}input,textarea,select{width:100%;padding:12px;border-radius:12px;border:1px solid var(--border);background:#0e0e18;color:var(--text)}label{font-size:13px;color:var(--muted);font-weight:800}.wrap{max-width:1180px;margin:0 auto;padding:22px}.hero{display:flex;gap:18px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:18px}.title h1{font-size:clamp(30px,5vw,58px);margin:0;letter-spacing:-2px}.title p{color:var(--muted);margin:8px 0 0}.pill{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border:1px solid var(--border);border-radius:999px;background:rgba(255,255,255,.06);color:var(--muted);font-weight:800}.dot{width:10px;height:10px;border-radius:50%;background:var(--green);box-shadow:0 0 16px var(--green)}.grid{display:grid;grid-template-columns:1.1fr .9fr;gap:18px}.panel{background:rgba(21,21,34,.92);border:1px solid var(--border);border-radius:22px;padding:18px;box-shadow:0 18px 50px rgba(0,0,0,.35)}.tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}.tab{background:var(--card2);color:var(--muted)}.tab.active{background:var(--red);color:white}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.stack{display:grid;gap:12px}.stream{display:grid;grid-template-columns:140px 1fr;gap:14px;background:#10101b;border:1px solid var(--border);border-radius:18px;padding:12px;margin-bottom:12px}.thumb{width:140px;aspect-ratio:16/9;border-radius:14px;background:#27273a;object-fit:cover}.badge{display:inline-block;padding:6px 10px;border-radius:999px;font-size:12px;font-weight:900;text-transform:uppercase}.live{background:var(--green);color:#061209}.upcoming{background:var(--blue);color:#06101d}.pending{background:var(--yellow);color:#211600}.rejected,.ended{background:#555;color:white}.meta{color:var(--muted);font-size:14px}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.hidden{display:none!important}.mini{font-size:12px;color:var(--muted)}.notice{padding:12px;border-radius:14px;border:1px solid var(--border);background:rgba(255,255,255,.05);color:var(--muted)}.adminOnly{border-color:rgba(255,45,45,.35)}.countdown{margin-top:8px;font-weight:900;color:var(--yellow);font-size:15px}.countdown.liveText{color:var(--green)}.countdown.endedText{color:var(--muted)}@media(max-width:900px){.grid{grid-template-columns:1fr}.stream{grid-template-columns:1fr}.thumb{width:100%}.row{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -531,6 +531,49 @@ function defaultThumb(stream) {
   return stream.thumbnail_url || 'https://dummyimage.com/1280x720/202033/ffffff&text=YouTube+Stream';
 }
 
+function formatCountdown(ms) {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (days > 0) return days + 'd ' + hours + 'h ' + minutes + 'm ' + seconds + 's';
+  if (hours > 0) return hours + 'h ' + minutes + 'm ' + seconds + 's';
+  if (minutes > 0) return minutes + 'm ' + seconds + 's';
+  return seconds + 's';
+}
+
+function updateCountdowns() {
+  document.querySelectorAll('.countdown').forEach(function (el) {
+    const start = new Date(el.dataset.start).getTime();
+    const durationMinutes = Number(el.dataset.duration || 120);
+    const end = start + durationMinutes * 60 * 1000;
+    const now = Date.now();
+
+    el.classList.remove('liveText', 'endedText');
+
+    if (!start || isNaN(start)) {
+      el.textContent = '';
+      return;
+    }
+
+    if (now < start) {
+      el.textContent = 'Starts in ' + formatCountdown(start - now);
+      return;
+    }
+
+    if (now >= start && now <= end) {
+      el.classList.add('liveText');
+      el.textContent = 'LIVE NOW • Ends in ' + formatCountdown(end - now);
+      return;
+    }
+
+    el.classList.add('endedText');
+    el.textContent = 'Ended ' + formatCountdown(now - end) + ' ago';
+  });
+}
+
 function renderStream(stream, admin) {
   const status = stream.computed_status || stream.status;
   const link = stream.youtube_video_url || stream.channel_url || '#';
@@ -551,6 +594,7 @@ function renderStream(stream, admin) {
     '<span class="badge ' + esc(status) + '">' + esc(status) + '</span>' +
     '<h3>' + esc(stream.title) + '</h3>' +
     '<div class="meta"><b>' + esc(stream.channel_name) + '</b> • ' + fmtTime(stream.scheduled_at) + ' • ' + esc(stream.duration_minutes) + ' min</div>' +
+    '<div class="countdown" data-start="' + esc(stream.scheduled_at) + '" data-duration="' + esc(stream.duration_minutes) + '"></div>' +
     '<div class="meta">' + esc(stream.bio || '') + '</div>' +
     '<div class="actions">' +
     '<a href="' + esc(link) + '" target="_blank"><button class="secondary" type="button">Open Stream</button></a>' +
@@ -568,9 +612,12 @@ function render() {
   $('upcomingList').innerHTML = upcomingHtml || '<div class="notice">No approved upcoming streams yet.</div>';
   $('endedList').innerHTML = endedHtml || '<div class="notice">No ended streams yet.</div>';
 
+  updateCountdowns();
+
   if (me && me.is_admin) {
     const adminHtml = streams.filter(function (s) { return s.status !== 'approved'; }).map(function (s) { return renderStream(s, true); }).join('');
     $('adminList').innerHTML = adminHtml || '<div class="notice">No pending streams.</div>';
+    updateCountdowns();
   }
 }
 
@@ -692,6 +739,7 @@ try {
   es.onerror = function () { $('connectionStatus').textContent = 'Polling backup active'; };
 } catch (e) {}
 
+setInterval(updateCountdowns, 1000);
 setInterval(load, 30000);
 load().catch(function (err) { console.error(err); });
 </script>
