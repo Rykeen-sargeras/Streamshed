@@ -130,10 +130,8 @@ function requireAdmin(handler) {
 
 const clients = new Set();
 function broadcast(type = "refresh") {
-  const payload = "event: " + type + "
-data: " + JSON.stringify({ at: Date.now() }) + "
-
-";
+  const nl = String.fromCharCode(10);
+  const payload = "event: " + type + nl + "data: " + JSON.stringify({ at: Date.now() }) + nl + nl;
   for (const res of clients) res.write(payload);
 }
 
