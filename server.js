@@ -1,5 +1,5 @@
 // server.js
-// Streamshed - YouTube Stream Schedule Sign-Up App
+// Streamshed - YouTube Stream Schedule + Tracked YouTube Channels
 // Railway + GitHub friendly single-file Node/Express app.
 // Admin login defaults:
 // username: admin
@@ -20,6 +20,7 @@ const ADMIN_USER = process.env.ADMIN_USER || "admin";
 const ADMIN_PASS = process.env.ADMIN_PASS || "madrox79";
 const ADMIN_IP = process.env.ADMIN_IP || "";
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || "";
+const AUTO_SCAN_MINUTES = Number(process.env.AUTO_SCAN_MINUTES || 5);
 
 if (!fs.existsSync("./data")) fs.mkdirSync("./data");
 
@@ -72,7 +73,10 @@ function all(sql, params = []) {
 
 async function initDb() {
   await run("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, channel_name TEXT DEFAULT '', channel_url TEXT DEFAULT '', bio TEXT DEFAULT '', avatar_url TEXT DEFAULT '', is_admin INTEGER DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP)");
+
   await run("CREATE TABLE IF NOT EXISTS streams (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, channel_name TEXT NOT NULL, channel_url TEXT NOT NULL, title TEXT NOT NULL, scheduled_at TEXT NOT NULL, duration_minutes INTEGER DEFAULT 120, thumbnail_url TEXT DEFAULT '', youtube_video_url TEXT DEFAULT '', status TEXT DEFAULT 'pending', created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(user_id) REFERENCES users(id))");
+
+  await run("CREATE TABLE IF NOT EXISTS tracked_channels (id INTEGER PRIMARY KEY AUTOINCREMENT, channel_name TEXT DEFAULT '', channel_url TEXT UNIQUE NOT NULL, default_duration_minutes INTEGER DEFAULT 120, enabled INTEGER DEFAULT 1, last_checked_at TEXT DEFAULT '', last_result TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP)");
 
   const admin = await get("SELECT id FROM users WHERE username = ?", [ADMIN_USER]);
   if (!admin) {
@@ -252,6 +256,73 @@ async function youtubeLookup(channelUrl) {
   return result;
 }
 
+async function saveTrackedChannel(channelUrl, channelName = "") {
+  const cleanUrl = safeString(channelUrl);
+  const cleanName = safeString(channelName, cleanUrl);
+  if (!cleanUrl) return null;
+
+  const existing = await get("SELECT id FROM tracked_channels WHERE channel_url = ?", [cleanUrl]);
+  if (existing) {
+    await run("UPDATE tracked_channels SET channel_name = ?, enabled = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [cleanName, existing.id]);
+    return existing.id;
+  }
+
+  const out = await run("INSERT INTO tracked_channels (channel_name, channel_url, enabled) VALUES (?, ?, 1)", [cleanName, cleanUrl]);
+  return out.lastID;
+}
+
+async function upsertStreamFromLookup(lookup, trackedChannel) {
+  if (!lookup || !lookup.scheduledAt) return { added: false, reason: "no_scheduled_stream" };
+
+  const channelName = safeString(lookup.channelName, trackedChannel.channel_name || "YouTube Creator");
+  const channelUrl = safeString(lookup.channelUrl, trackedChannel.channel_url);
+  const title = safeString(lookup.title, "Scheduled Stream");
+  const scheduledAt = safeString(lookup.scheduledAt);
+  const duration = Number(trackedChannel.default_duration_minutes || 120);
+  const thumb = safeString(lookup.thumbnailUrl);
+  const video = safeString(lookup.videoUrl);
+
+  let existing = null;
+  if (video) existing = await get("SELECT id FROM streams WHERE youtube_video_url = ?", [video]);
+  if (!existing) existing = await get("SELECT id FROM streams WHERE channel_url = ? AND scheduled_at = ?", [channelUrl, scheduledAt]);
+
+  if (existing) {
+    await run("UPDATE streams SET channel_name=?, title=?, duration_minutes=?, thumbnail_url=?, youtube_video_url=?, status='approved', updated_at=CURRENT_TIMESTAMP WHERE id=?", [channelName, title, duration, thumb, video, existing.id]);
+    return { added: false, updated: true, id: existing.id };
+  }
+
+  const out = await run("INSERT INTO streams (user_id, channel_name, channel_url, title, scheduled_at, duration_minutes, thumbnail_url, youtube_video_url, status) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, 'approved')", [channelName, channelUrl, title, scheduledAt, duration, thumb, video]);
+  return { added: true, updated: false, id: out.lastID };
+}
+
+async function scanTrackedChannel(channel) {
+  const lookup = await youtubeLookup(channel.channel_url);
+  const addResult = await upsertStreamFromLookup(lookup, channel);
+  const resultText = lookup.source + (lookup.scheduledAt ? " - stream found" : " - no upcoming stream");
+
+  await run("UPDATE tracked_channels SET channel_name = ?, channel_url = ?, last_checked_at = ?, last_result = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [safeString(lookup.channelName, channel.channel_name), safeString(lookup.channelUrl, channel.channel_url), new Date().toISOString(), resultText, channel.id]);
+
+  return { channel: channel.channel_name || channel.channel_url, lookup, addResult };
+}
+
+async function scanAllTrackedChannels() {
+  const channels = await all("SELECT * FROM tracked_channels WHERE enabled = 1 ORDER BY channel_name ASC");
+  const results = [];
+
+  for (const channel of channels) {
+    try {
+      results.push(await scanTrackedChannel(channel));
+    } catch (err) {
+      console.error("Tracked channel scan failed:", channel.channel_url, err.message);
+      await run("UPDATE tracked_channels SET last_checked_at = ?, last_result = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [new Date().toISOString(), "scan failed: " + err.message, channel.id]);
+      results.push({ channel: channel.channel_name || channel.channel_url, error: err.message });
+    }
+  }
+
+  if (results.length) broadcast();
+  return results;
+}
+
 app.get("/favicon.ico", (req, res) => res.status(204).end());
 
 app.get("/api/events", async (req, res) => {
@@ -387,8 +458,47 @@ app.post("/api/streams/:id/reject", requireAdmin(async (req, res) => {
 app.post("/api/youtube/lookup", requireAdmin(async (req, res) => {
   const channelUrl = safeString(req.body.channelUrl);
   if (!channelUrl) return res.status(400).json({ error: "Channel URL required." });
+
   const data = await youtubeLookup(channelUrl);
+  const trackedId = await saveTrackedChannel(data.channelUrl || channelUrl, data.channelName || channelUrl);
+  data.tracked = true;
+  data.trackedId = trackedId;
+
   res.json(data);
+}));
+
+app.get("/api/tracked", requireAdmin(async (req, res) => {
+  const channels = await all("SELECT * FROM tracked_channels ORDER BY enabled DESC, channel_name ASC");
+  res.json({ channels });
+}));
+
+app.post("/api/tracked", requireAdmin(async (req, res) => {
+  const channelUrl = safeString(req.body.channelUrl);
+  const channelName = safeString(req.body.channelName, channelUrl);
+  if (!channelUrl) return res.status(400).json({ error: "Channel URL required." });
+  const id = await saveTrackedChannel(channelUrl, channelName);
+  broadcast();
+  res.json({ ok: true, id });
+}));
+
+app.post("/api/tracked/:id/toggle", requireAdmin(async (req, res) => {
+  const id = Number(req.params.id);
+  const row = await get("SELECT enabled FROM tracked_channels WHERE id = ?", [id]);
+  if (!row) return res.status(404).json({ error: "Tracked channel not found." });
+  await run("UPDATE tracked_channels SET enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [row.enabled ? 0 : 1, id]);
+  broadcast();
+  res.json({ ok: true });
+}));
+
+app.delete("/api/tracked/:id", requireAdmin(async (req, res) => {
+  await run("DELETE FROM tracked_channels WHERE id = ?", [Number(req.params.id)]);
+  broadcast();
+  res.json({ ok: true });
+}));
+
+app.post("/api/tracked/scan", requireAdmin(async (req, res) => {
+  const results = await scanAllTrackedChannels();
+  res.json({ ok: true, results });
 }));
 
 app.get("/", (req, res) => {
@@ -403,7 +513,7 @@ const INDEX_HTML = `<!DOCTYPE html>
 <title>Streamshed Schedule</title>
 <style>
 :root{--bg:#09090f;--card:#151522;--card2:#202033;--text:#f8f8fb;--muted:#b8b8ca;--red:#ff2d2d;--green:#2be282;--yellow:#ffd166;--blue:#69a7ff;--border:rgba(255,255,255,.12)}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#23233a,#09090f 45%);color:var(--text);font-family:Arial,Helvetica,sans-serif}button,input,textarea,select{font:inherit}button{cursor:pointer;border:0;border-radius:12px;padding:10px 14px;font-weight:800;background:var(--red);color:#fff}button.secondary{background:var(--card2)}button.good{background:var(--green);color:#051009}button.warn{background:var(--yellow);color:#1d1400}button.blue{background:var(--blue);color:#06101d}input,textarea,select{width:100%;padding:12px;border-radius:12px;border:1px solid var(--border);background:#0e0e18;color:var(--text)}label{font-size:13px;color:var(--muted);font-weight:800}.wrap{max-width:1180px;margin:0 auto;padding:22px}.hero{display:flex;gap:18px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:18px}.title h1{font-size:clamp(30px,5vw,58px);margin:0;letter-spacing:-2px}.title p{color:var(--muted);margin:8px 0 0}.pill{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border:1px solid var(--border);border-radius:999px;background:rgba(255,255,255,.06);color:var(--muted);font-weight:800}.dot{width:10px;height:10px;border-radius:50%;background:var(--green);box-shadow:0 0 16px var(--green)}.grid{display:grid;grid-template-columns:1.1fr .9fr;gap:18px}.panel{background:rgba(21,21,34,.92);border:1px solid var(--border);border-radius:22px;padding:18px;box-shadow:0 18px 50px rgba(0,0,0,.35)}.tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}.tab{background:var(--card2);color:var(--muted)}.tab.active{background:var(--red);color:white}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.stack{display:grid;gap:12px}.stream{display:grid;grid-template-columns:140px 1fr;gap:14px;background:#10101b;border:1px solid var(--border);border-radius:18px;padding:12px;margin-bottom:12px}.thumb{width:140px;aspect-ratio:16/9;border-radius:14px;background:#27273a;object-fit:cover}.badge{display:inline-block;padding:6px 10px;border-radius:999px;font-size:12px;font-weight:900;text-transform:uppercase}.live{background:var(--green);color:#061209}.upcoming{background:var(--blue);color:#06101d}.pending{background:var(--yellow);color:#211600}.rejected,.ended{background:#555;color:white}.meta{color:var(--muted);font-size:14px}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.hidden{display:none!important}.mini{font-size:12px;color:var(--muted)}.notice{padding:12px;border-radius:14px;border:1px solid var(--border);background:rgba(255,255,255,.05);color:var(--muted)}.adminOnly{border-color:rgba(255,45,45,.35)}.countdown{margin-top:8px;font-weight:900;color:var(--yellow);font-size:15px}.countdown.liveText{color:var(--green)}.countdown.endedText{color:var(--muted)}@media(max-width:900px){.grid{grid-template-columns:1fr}.stream{grid-template-columns:1fr}.thumb{width:100%}.row{grid-template-columns:1fr}}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#23233a,#09090f 45%);color:var(--text);font-family:Arial,Helvetica,sans-serif}button,input,textarea,select{font:inherit}button{cursor:pointer;border:0;border-radius:12px;padding:10px 14px;font-weight:800;background:var(--red);color:#fff}button.secondary{background:var(--card2)}button.good{background:var(--green);color:#051009}button.warn{background:var(--yellow);color:#1d1400}button.blue{background:var(--blue);color:#06101d}input,textarea,select{width:100%;padding:12px;border-radius:12px;border:1px solid var(--border);background:#0e0e18;color:var(--text)}label{font-size:13px;color:var(--muted);font-weight:800}.wrap{max-width:1180px;margin:0 auto;padding:22px}.hero{display:flex;gap:18px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:18px}.title h1{font-size:clamp(30px,5vw,58px);margin:0;letter-spacing:-2px}.title p{color:var(--muted);margin:8px 0 0}.pill{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border:1px solid var(--border);border-radius:999px;background:rgba(255,255,255,.06);color:var(--muted);font-weight:800}.dot{width:10px;height:10px;border-radius:50%;background:var(--green);box-shadow:0 0 16px var(--green)}.grid{display:grid;grid-template-columns:1.1fr .9fr;gap:18px}.panel{background:rgba(21,21,34,.92);border:1px solid var(--border);border-radius:22px;padding:18px;box-shadow:0 18px 50px rgba(0,0,0,.35)}.tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}.tab{background:var(--card2);color:var(--muted)}.tab.active{background:var(--red);color:white}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.stack{display:grid;gap:12px}.stream{display:grid;grid-template-columns:140px 1fr;gap:14px;background:#10101b;border:1px solid var(--border);border-radius:18px;padding:12px;margin-bottom:12px}.thumb{width:140px;aspect-ratio:16/9;border-radius:14px;background:#27273a;object-fit:cover}.badge{display:inline-block;padding:6px 10px;border-radius:999px;font-size:12px;font-weight:900;text-transform:uppercase}.live{background:var(--green);color:#061209}.upcoming{background:var(--blue);color:#06101d}.pending{background:var(--yellow);color:#211600}.rejected,.ended{background:#555;color:white}.meta{color:var(--muted);font-size:14px}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.hidden{display:none!important}.mini{font-size:12px;color:var(--muted)}.notice{padding:12px;border-radius:14px;border:1px solid var(--border);background:rgba(255,255,255,.05);color:var(--muted)}.adminOnly{border-color:rgba(255,45,45,.35)}.countdown{margin-top:8px;font-weight:900;color:var(--yellow);font-size:15px}.countdown.liveText{color:var(--green)}.countdown.endedText{color:var(--muted)}.tracked{background:#10101b;border:1px solid var(--border);border-radius:16px;padding:12px;margin-bottom:10px}.tracked.off{opacity:.55}@media(max-width:900px){.grid{grid-template-columns:1fr}.stream{grid-template-columns:1fr}.thumb{width:100%}.row{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -461,14 +571,28 @@ const INDEX_HTML = `<!DOCTYPE html>
       <div id="view-setup" class="view hidden">
         <h2>Admin Setup / YouTube Lookup</h2>
         <div class="panel adminOnly">
-          <p class="mini">Paste a channel URL. The server tries the YouTube API first if YOUTUBE_API_KEY is set.</p>
+          <p class="mini">Paste a channel URL. Every lookup is saved to Always Checked Channels.</p>
           <div class="stack">
             <label>Streamer Channel URL</label>
             <input id="lookupUrl" placeholder="https://youtube.com/@creator" />
-            <button id="lookupBtn" type="button" class="blue">Auto-Lookup Scheduled Stream</button>
+            <button id="lookupBtn" type="button" class="blue">Auto-Lookup + Save Channel</button>
             <button id="addLookupBtn" type="button" class="good">Add Lookup Result as Pending Stream</button>
             <pre id="lookupResult" class="notice" style="white-space:pre-wrap"></pre>
           </div>
+        </div>
+
+        <div class="panel adminOnly" style="margin-top:14px">
+          <h3>Always Checked Channels</h3>
+          <p class="mini">These channels are checked automatically every few minutes. Use Check Now to scan immediately.</p>
+          <div class="row">
+            <div><label>Channel Name</label><input id="trackedName" placeholder="Optional" /></div>
+            <div><label>Channel URL</label><input id="trackedUrl" placeholder="https://youtube.com/@creator" /></div>
+          </div>
+          <div class="actions">
+            <button id="addTrackedBtn" type="button" class="good">Add Channel</button>
+            <button id="scanTrackedBtn" type="button" class="blue">Check Now</button>
+          </div>
+          <div id="trackedList" style="margin-top:12px"></div>
         </div>
       </div>
     </section>
@@ -502,6 +626,7 @@ const INDEX_HTML = `<!DOCTYPE html>
 <script>
 let me = null;
 let streams = [];
+let trackedChannels = [];
 let lastLookup = null;
 const $ = (id) => document.getElementById(id);
 
@@ -523,7 +648,7 @@ async function api(path, options) {
 
 function fmtTime(iso) {
   const d = new Date(iso);
-  if (isNaN(d.getTime())) return iso;
+  if (isNaN(d.getTime())) return iso || 'Never';
   return d.toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 }
 
@@ -537,7 +662,6 @@ function formatCountdown(ms) {
   const hours = Math.floor((totalSeconds % 86400) / 3600);
   const minutes = Math.floor((totalSeconds % 3600) / 60);
   const seconds = totalSeconds % 60;
-
   if (days > 0) return days + 'd ' + hours + 'h ' + minutes + 'm ' + seconds + 's';
   if (hours > 0) return hours + 'h ' + minutes + 'm ' + seconds + 's';
   if (minutes > 0) return minutes + 'm ' + seconds + 's';
@@ -550,25 +674,10 @@ function updateCountdowns() {
     const durationMinutes = Number(el.dataset.duration || 120);
     const end = start + durationMinutes * 60 * 1000;
     const now = Date.now();
-
     el.classList.remove('liveText', 'endedText');
-
-    if (!start || isNaN(start)) {
-      el.textContent = '';
-      return;
-    }
-
-    if (now < start) {
-      el.textContent = 'Starts in ' + formatCountdown(start - now);
-      return;
-    }
-
-    if (now >= start && now <= end) {
-      el.classList.add('liveText');
-      el.textContent = 'LIVE NOW • Ends in ' + formatCountdown(end - now);
-      return;
-    }
-
+    if (!start || isNaN(start)) { el.textContent = ''; return; }
+    if (now < start) { el.textContent = 'Starts in ' + formatCountdown(start - now); return; }
+    if (now >= start && now <= end) { el.classList.add('liveText'); el.textContent = 'LIVE NOW'; return; }
     el.classList.add('endedText');
     el.textContent = 'Ended ' + formatCountdown(now - end) + ' ago';
   });
@@ -578,7 +687,6 @@ function renderStream(stream, admin) {
   const status = stream.computed_status || stream.status;
   const link = stream.youtube_video_url || stream.channel_url || '#';
   let adminButtons = '';
-
   if (admin) {
     adminButtons =
       '<button class="good" type="button" onclick="approve(' + stream.id + ')">Approve</button>' +
@@ -586,7 +694,6 @@ function renderStream(stream, admin) {
       '<button class="blue" type="button" onclick="editStream(' + stream.id + ')">Edit</button>' +
       '<button class="secondary" type="button" onclick="deleteStream(' + stream.id + ')">Delete</button>';
   }
-
   return '' +
     '<div class="stream">' +
     '<img class="thumb" src="' + esc(defaultThumb(stream)) + '" alt="Stream thumbnail">' +
@@ -602,6 +709,24 @@ function renderStream(stream, admin) {
     '</div></div></div>';
 }
 
+function renderTracked() {
+  if (!(me && me.is_admin)) return;
+  const html = trackedChannels.map(function (c) {
+    const state = c.enabled ? 'Enabled' : 'Disabled';
+    return '' +
+      '<div class="tracked ' + (c.enabled ? '' : 'off') + '">' +
+      '<b>' + esc(c.channel_name || c.channel_url) + '</b>' +
+      '<div class="meta">' + esc(c.channel_url) + '</div>' +
+      '<div class="meta">' + state + ' • Last checked: ' + esc(c.last_checked_at ? fmtTime(c.last_checked_at) : 'Never') + '</div>' +
+      '<div class="meta">Result: ' + esc(c.last_result || 'Not checked yet') + '</div>' +
+      '<div class="actions">' +
+      '<button class="secondary" type="button" onclick="toggleTracked(' + c.id + ')">' + (c.enabled ? 'Disable' : 'Enable') + '</button>' +
+      '<button class="warn" type="button" onclick="deleteTracked(' + c.id + ')">Delete</button>' +
+      '</div></div>';
+  }).join('');
+  $('trackedList').innerHTML = html || '<div class="notice">No always-checked channels yet.</div>';
+}
+
 function render() {
   const approved = streams.filter(function (s) { return s.status === 'approved'; });
   const liveHtml = approved.filter(function (s) { return s.computed_status === 'live'; }).map(function (s) { return renderStream(s, false); }).join('');
@@ -611,12 +736,12 @@ function render() {
   $('liveList').innerHTML = liveHtml || '<div class="notice">Nobody is marked live right now.</div>';
   $('upcomingList').innerHTML = upcomingHtml || '<div class="notice">No approved upcoming streams yet.</div>';
   $('endedList').innerHTML = endedHtml || '<div class="notice">No ended streams yet.</div>';
-
   updateCountdowns();
 
   if (me && me.is_admin) {
     const adminHtml = streams.filter(function (s) { return s.status !== 'approved'; }).map(function (s) { return renderStream(s, true); }).join('');
     $('adminList').innerHTML = adminHtml || '<div class="notice">No pending streams.</div>';
+    renderTracked();
     updateCountdowns();
   }
 }
@@ -624,7 +749,6 @@ function render() {
 async function load() {
   const meData = await api('/api/me');
   me = meData.user;
-
   document.querySelectorAll('.adminTab').forEach(function (x) { x.classList.toggle('hidden', !(me && me.is_admin)); });
   $('loggedOut').classList.toggle('hidden', !!me);
   $('loggedIn').classList.toggle('hidden', !me);
@@ -646,22 +770,29 @@ async function load() {
 
   const data = await api('/api/streams');
   streams = data.streams;
+
+  if (me && me.is_admin) {
+    const trackedData = await api('/api/tracked');
+    trackedChannels = trackedData.channels;
+  } else {
+    trackedChannels = [];
+  }
+
   render();
 }
 
 async function approve(id) { await api('/api/streams/' + id + '/approve', { method: 'POST' }); await load(); }
 async function rejectStream(id) { await api('/api/streams/' + id + '/reject', { method: 'POST' }); await load(); }
 async function deleteStream(id) { if (confirm('Delete this stream?')) { await api('/api/streams/' + id, { method: 'DELETE' }); await load(); } }
+async function toggleTracked(id) { await api('/api/tracked/' + id + '/toggle', { method: 'POST' }); await load(); }
+async function deleteTracked(id) { if (confirm('Delete this tracked channel?')) { await api('/api/tracked/' + id, { method: 'DELETE' }); await load(); } }
 async function editStream(id) {
   const s = streams.find(function (x) { return x.id === id; });
   if (!s) return;
   const title = prompt('Stream title', s.title) || s.title;
   const scheduledAt = prompt('Scheduled time ISO format', s.scheduled_at) || s.scheduled_at;
   const status = prompt('Status: pending, approved, rejected', s.status) || s.status;
-  await api('/api/streams/' + id, {
-    method: 'PUT',
-    body: JSON.stringify({ channelName: s.channel_name, channelUrl: s.channel_url, title: title, scheduledAt: scheduledAt, durationMinutes: s.duration_minutes, thumbnailUrl: s.thumbnail_url, youtubeVideoUrl: s.youtube_video_url, status: status })
-  });
+  await api('/api/streams/' + id, { method: 'PUT', body: JSON.stringify({ channelName: s.channel_name, channelUrl: s.channel_url, title: title, scheduledAt: scheduledAt, durationMinutes: s.duration_minutes, thumbnailUrl: s.thumbnail_url, youtubeVideoUrl: s.youtube_video_url, status: status }) });
   await load();
 }
 
@@ -679,24 +810,15 @@ function bindTabs() {
 function bindForms() {
   $('loginForm').addEventListener('submit', async function (e) {
     e.preventDefault();
-    try {
-      await api('/api/login', { method: 'POST', body: JSON.stringify({ username: $('loginUser').value, password: $('loginPass').value }) });
-      await load();
-    } catch (err) { alert(err.message); }
+    try { await api('/api/login', { method: 'POST', body: JSON.stringify({ username: $('loginUser').value, password: $('loginPass').value }) }); await load(); } catch (err) { alert(err.message); }
   });
 
   $('registerForm').addEventListener('submit', async function (e) {
     e.preventDefault();
-    try {
-      await api('/api/register', { method: 'POST', body: JSON.stringify({ username: $('regUser').value, password: $('regPass').value, channelName: $('regChannelName').value, channelUrl: $('regChannelUrl').value }) });
-      await load();
-    } catch (err) { alert(err.message); }
+    try { await api('/api/register', { method: 'POST', body: JSON.stringify({ username: $('regUser').value, password: $('regPass').value, channelName: $('regChannelName').value, channelUrl: $('regChannelUrl').value }) }); await load(); } catch (err) { alert(err.message); }
   });
 
-  $('logoutBtn').addEventListener('click', async function () {
-    await api('/api/logout', { method: 'POST' });
-    location.reload();
-  });
+  $('logoutBtn').addEventListener('click', async function () { await api('/api/logout', { method: 'POST' }); location.reload(); });
 
   $('profileForm').addEventListener('submit', async function (e) {
     e.preventDefault();
@@ -714,10 +836,11 @@ function bindForms() {
   });
 
   $('lookupBtn').addEventListener('click', async function () {
-    $('lookupResult').textContent = 'Looking up...';
+    $('lookupResult').textContent = 'Looking up and saving channel...';
     try {
       lastLookup = await api('/api/youtube/lookup', { method: 'POST', body: JSON.stringify({ channelUrl: $('lookupUrl').value }) });
       $('lookupResult').textContent = JSON.stringify(lastLookup, null, 2);
+      await load();
     } catch (err) { $('lookupResult').textContent = err.message; }
   });
 
@@ -727,6 +850,25 @@ function bindForms() {
     await api('/api/streams', { method: 'POST', body: JSON.stringify({ channelName: lastLookup.channelName || 'YouTube Creator', channelUrl: lastLookup.channelUrl || $('lookupUrl').value, title: lastLookup.title || 'Scheduled Stream', scheduledAt: lastLookup.scheduledAt, durationMinutes: 120, thumbnailUrl: lastLookup.thumbnailUrl || '', youtubeVideoUrl: lastLookup.videoUrl || '' }) });
     alert('Lookup result added as pending stream. Approve it in Admin Approval.');
     await load();
+  });
+
+  $('addTrackedBtn').addEventListener('click', async function () {
+    try {
+      await api('/api/tracked', { method: 'POST', body: JSON.stringify({ channelName: $('trackedName').value, channelUrl: $('trackedUrl').value }) });
+      $('trackedName').value = '';
+      $('trackedUrl').value = '';
+      await load();
+    } catch (err) { alert(err.message); }
+  });
+
+  $('scanTrackedBtn').addEventListener('click', async function () {
+    $('scanTrackedBtn').textContent = 'Checking...';
+    try {
+      await api('/api/tracked/scan', { method: 'POST' });
+      await load();
+      alert('Checked always-tracked channels.');
+    } catch (err) { alert(err.message); }
+    $('scanTrackedBtn').textContent = 'Check Now';
   });
 }
 
@@ -751,6 +893,15 @@ initDb()
     app.listen(PORT, () => {
       console.log("Streamshed running on port " + PORT);
     });
+
+    const scanMs = Math.max(1, AUTO_SCAN_MINUTES) * 60 * 1000;
+    setInterval(() => {
+      scanAllTrackedChannels().catch((err) => console.error("Auto scan failed:", err.message));
+    }, scanMs);
+
+    setTimeout(() => {
+      scanAllTrackedChannels().catch((err) => console.error("Initial auto scan failed:", err.message));
+    }, 10000);
   })
   .catch((err) => {
     console.error("Failed to start app:", err);
