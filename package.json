@@ -1,10 +1,19 @@
 {
-  "scripts": { "start": "node server.js" },
+  "name": "streamshed",
+  "version": "1.0.0",
+  "description": "Streamshed - YouTube stream schedule with admin approval and auto-detection",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
-    "bcryptjs": "^2.4.3",
-    "connect-sqlite3": "^0.9.15",
-    "express": "^4.18.3",
+    "express": "^4.19.2",
     "express-session": "^1.18.0",
-    "sqlite3": "^5.1.7"
+    "connect-sqlite3": "^0.9.15",
+    "sqlite3": "^5.1.7",
+    "bcryptjs": "^2.4.3"
   }
 }
