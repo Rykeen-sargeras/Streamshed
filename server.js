@@ -188,6 +188,54 @@ function extractYouTubeHandleOrId(url) {
   return { type: "search", value: text };
 }
 
+function extractYouTubeVideoId(url) {
+  const text = safeString(url);
+  const patterns = [
+    /youtu\.be\/([A-Za-z0-9_-]{11})/i,
+    /youtube\.com\/watch\?(?:.*&)?v=([A-Za-z0-9_-]{11})/i,
+    /youtube\.com\/live\/([A-Za-z0-9_-]{11})/i,
+    /youtube\.com\/shorts\/([A-Za-z0-9_-]{11})/i,
+    /^[A-Za-z0-9_-]{11}$/
+  ];
+  for (const re of patterns) {
+    const m = text.match(re);
+    if (m) return m[1] || m[0];
+  }
+  return "";
+}
+
+async function fetchVideoStreamResult(videoId) {
+  if (!YOUTUBE_API_KEY || !videoId) return null;
+
+  const dUrl = "https://www.googleapis.com/youtube/v3/videos?part=snippet,liveStreamingDetails&id=" + encodeURIComponent(videoId) + "&key=" + encodeURIComponent(YOUTUBE_API_KEY);
+  const detail = await fetchJson(dUrl);
+  const v = detail.items && detail.items[0];
+  if (!v || !v.snippet) return null;
+
+  const lsd = v.liveStreamingDetails || {};
+  const isLive = !!(lsd.actualStartTime && !lsd.actualEndTime);
+  const isUpcoming = !!(lsd.scheduledStartTime && !lsd.actualStartTime);
+
+  // Only import live/upcoming livestreams here. Normal uploaded videos belong in /api/videos.
+  if (!isLive && !isUpcoming) return null;
+
+  const thumbs = v.snippet.thumbnails || {};
+  const thumb = (thumbs.maxres && thumbs.maxres.url) || (thumbs.high && thumbs.high.url) || (thumbs.medium && thumbs.medium.url) || "";
+  const channelId = v.snippet.channelId || "";
+
+  return {
+    channelName: v.snippet.channelTitle || "YouTube Creator",
+    channelUrl: channelId ? "https://www.youtube.com/channel/" + channelId : "",
+    avatarUrl: "",
+    title: v.snippet.title || "Live Stream",
+    thumbnailUrl: thumb,
+    videoUrl: "https://www.youtube.com/watch?v=" + videoId,
+    scheduledAt: lsd.scheduledStartTime || lsd.actualStartTime || new Date().toISOString(),
+    isLive: isLive ? 1 : 0,
+    source: "youtube_api_video",
+  };
+}
+
 async function fetchJson(url) {
   const r = await fetch(url, { headers: { "User-Agent": "streamshed-schedule-app" } });
   if (!r.ok) throw new Error("Fetch failed " + r.status);
@@ -239,8 +287,28 @@ async function resolveChannelInfo(channelUrl) {
 
 // Pull live AND upcoming streams from a channel, returning an array
 async function fetchAllStreams(channelUrl) {
-  const info = await resolveChannelInfo(channelUrl);
+  const directVideoId = extractYouTubeVideoId(channelUrl);
   const results = [];
+
+  // If someone pastes a direct YouTube live/watch URL instead of a channel URL,
+  // check that video first so Live Now can still populate.
+  if (YOUTUBE_API_KEY && directVideoId) {
+    try {
+      const direct = await fetchVideoStreamResult(directVideoId);
+      if (direct) {
+        const info = {
+          channelId: direct.channelUrl.replace("https://www.youtube.com/channel/", ""),
+          channelName: direct.channelName,
+          avatarUrl: direct.avatarUrl || "",
+        };
+        return { info, results: [direct] };
+      }
+    } catch (err) {
+      console.error("fetch direct video err:", err.message);
+    }
+  }
+
+  const info = await resolveChannelInfo(channelUrl);
 
   if (YOUTUBE_API_KEY && info.channelId) {
     for (const eventType of ["live", "upcoming"]) {
@@ -376,11 +444,35 @@ async function scanTrackedChannel(channel) {
   const { info, results } = await fetchAllStreams(channel.channel_url);
   let added = 0;
   let updated = 0;
+
   for (const r of results) {
     if (!r.scheduledAt) continue;
     const out = await upsertStreamFromResult(r, channel);
     if (out.added) added++;
     if (out.updated) updated++;
+  }
+
+  // Keep Live Now accurate. Do not clear live status based on the default
+  // 120-minute duration, because real YouTube livestreams often run longer.
+  // Instead, after a successful API scan, trust the current live results.
+  if (YOUTUBE_API_KEY && info.channelId) {
+    const normalizedChannelUrl = "https://www.youtube.com/channel/" + info.channelId;
+    const liveVideoUrls = results
+      .filter((r) => r.isLive && r.videoUrl)
+      .map((r) => r.videoUrl);
+
+    if (liveVideoUrls.length) {
+      const placeholders = liveVideoUrls.map(() => "?").join(",");
+      await run(
+        "UPDATE streams SET is_live = 0, updated_at = CURRENT_TIMESTAMP WHERE is_live = 1 AND (channel_url = ? OR channel_url = ?) AND youtube_video_url NOT IN (" + placeholders + ")",
+        [normalizedChannelUrl, channel.channel_url, ...liveVideoUrls]
+      );
+    } else {
+      await run(
+        "UPDATE streams SET is_live = 0, updated_at = CURRENT_TIMESTAMP WHERE is_live = 1 AND (channel_url = ? OR channel_url = ?)",
+        [normalizedChannelUrl, channel.channel_url]
+      );
+    }
   }
 
   // Also scan for recent video uploads (not streams)
@@ -492,13 +584,17 @@ async function scanAllTrackedChannels() {
 
 // Auto-clear is_live flag for streams whose end time has passed
 async function clearStaleLiveFlags() {
-  const liveStreams = await all("SELECT id, scheduled_at, duration_minutes FROM streams WHERE is_live = 1");
+  // Safety cleanup only. Live status is primarily controlled by the YouTube API scan.
+  // This prevents a normal 2+ hour livestream from disappearing from Live Now.
+  const liveStreams = await all("SELECT id, scheduled_at FROM streams WHERE is_live = 1");
   const now = Date.now();
+  const maxLiveMs = 18 * 60 * 60 * 1000;
+
   for (const s of liveStreams) {
-    const end = new Date(s.scheduled_at).getTime() + Number(s.duration_minutes || 120) * 60 * 1000;
-    // Give a 10 min grace; API scan will re-set if still live
-    if (now > end + 10 * 60 * 1000) {
-      await run("UPDATE streams SET is_live = 0 WHERE id = ?", [s.id]);
+    const start = new Date(s.scheduled_at).getTime();
+    if (!start || isNaN(start)) continue;
+    if (now - start > maxLiveMs) {
+      await run("UPDATE streams SET is_live = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [s.id]);
     }
   }
 }
@@ -2542,13 +2638,22 @@ initDb()
     });
 
     const scanMs = Math.max(1, AUTO_SCAN_MINUTES) * 60 * 1000;
-    setInterval(() => {
-      scanAllTrackedChannels().catch((err) => console.error("Auto scan failed:", err.message));
-      clearStaleLiveFlags().catch((err) => console.error("Clear stale live failed:", err.message));
+    setInterval(async () => {
+      try {
+        await scanAllTrackedChannels();
+        await clearStaleLiveFlags();
+      } catch (err) {
+        console.error("Auto scan failed:", err.message);
+      }
     }, scanMs);
 
-    setTimeout(() => {
-      scanAllTrackedChannels().catch((err) => console.error("Initial auto scan failed:", err.message));
+    setTimeout(async () => {
+      try {
+        await scanAllTrackedChannels();
+        await clearStaleLiveFlags();
+      } catch (err) {
+        console.error("Initial auto scan failed:", err.message);
+      }
     }, 10000);
   })
   .catch((err) => {
