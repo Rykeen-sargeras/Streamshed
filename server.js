@@ -1670,7 +1670,7 @@ function fmtTime(iso) {
 function defaultThumb(stream) {
   if (stream.thumbnail_url) return stream.thumbnail_url;
   // YouTube auto-thumb from video URL
-  const m = String(stream.youtube_video_url || '').match(/[?&]v=([\w-]{11})|youtu\.be\/([\w-]{11})/);
+  const m = String(stream.youtube_video_url || '').match(/[?&]v=([A-Za-z0-9_-]{11})|youtu[.]be[/]([A-Za-z0-9_-]{11})/);
   if (m) return 'https://i.ytimg.com/vi/' + (m[1] || m[2]) + '/hqdefault.jpg';
   return '';
 }
@@ -1791,7 +1791,7 @@ function render() {
   // My streams
   if (me) {
     const mine = streams.filter(s => s.user_id === me.id);
-    $('mineList').innerHTML = mine.length ? mine.map(renderStream).join('') : emptyHtml('You haven\\'t submitted any streams.', '🎬');
+    $('mineList').innerHTML = mine.length ? mine.map(renderStream).join('') : emptyHtml('No streams submitted yet.', '🎬');
   }
 
   // Admin
