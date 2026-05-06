@@ -94,6 +94,9 @@ async function initDb() {
 
   await run("CREATE TABLE IF NOT EXISTS tracked_channels (id INTEGER PRIMARY KEY AUTOINCREMENT, channel_name TEXT DEFAULT '', channel_url TEXT UNIQUE NOT NULL, default_duration_minutes INTEGER DEFAULT 120, enabled INTEGER DEFAULT 1, last_checked_at TEXT DEFAULT '', last_result TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP)");
 
+  // Videos table - regular uploads (not streams). Highlighted for 12hrs after publishing.
+  await run("CREATE TABLE IF NOT EXISTS videos (id INTEGER PRIMARY KEY AUTOINCREMENT, channel_name TEXT NOT NULL, channel_url TEXT NOT NULL, channel_avatar TEXT DEFAULT '', title TEXT NOT NULL, video_id TEXT UNIQUE NOT NULL, video_url TEXT NOT NULL, thumbnail_url TEXT DEFAULT '', published_at TEXT NOT NULL, duration_seconds INTEGER DEFAULT 0, view_count INTEGER DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP)");
+
   // Add is_live column if upgrading from older schema
   try { await run("ALTER TABLE streams ADD COLUMN is_live INTEGER DEFAULT 0"); } catch (e) {}
 
@@ -379,11 +382,94 @@ async function scanTrackedChannel(channel) {
     if (out.added) added++;
     if (out.updated) updated++;
   }
-  const resultText = "Found " + results.length + " streams (" + added + " added, " + updated + " updated)";
+
+  // Also scan for recent video uploads (not streams)
+  let videosAdded = 0;
+  try {
+    const videos = await fetchRecentVideos(channel.channel_url, info);
+    for (const v of videos) {
+      const out = await upsertVideo(v, info);
+      if (out.added) videosAdded++;
+    }
+  } catch (e) { console.error("video scan err:", e.message); }
+
+  const resultText = "Found " + results.length + " streams (" + added + " added, " + updated + " updated), " + videosAdded + " new videos";
 
   await run("UPDATE tracked_channels SET channel_name = ?, channel_url = ?, last_checked_at = ?, last_result = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [safeString(info.channelName, channel.channel_name), safeString(channel.channel_url), new Date().toISOString(), resultText, channel.id]);
 
-  return { channel: channel.channel_name || channel.channel_url, added, updated, total: results.length };
+  return { channel: channel.channel_name || channel.channel_url, added, updated, total: results.length, videosAdded };
+}
+
+// Fetch recent video uploads from a channel (regular videos, not livestreams)
+async function fetchRecentVideos(channelUrl, info) {
+  const videos = [];
+  if (!YOUTUBE_API_KEY || !info.channelId) return videos;
+
+  try {
+    // Get the uploads playlist ID
+    const cUrl = "https://www.googleapis.com/youtube/v3/channels?part=contentDetails&id=" + encodeURIComponent(info.channelId) + "&key=" + encodeURIComponent(YOUTUBE_API_KEY);
+    const cData = await fetchJson(cUrl);
+    const item = cData.items && cData.items[0];
+    if (!item) return videos;
+    const uploadsPlaylistId = item.contentDetails && item.contentDetails.relatedPlaylists && item.contentDetails.relatedPlaylists.uploads;
+    if (!uploadsPlaylistId) return videos;
+
+    // Get last 10 uploads from that playlist
+    const pUrl = "https://www.googleapis.com/youtube/v3/playlistItems?part=snippet,contentDetails&playlistId=" + encodeURIComponent(uploadsPlaylistId) + "&maxResults=10&key=" + encodeURIComponent(YOUTUBE_API_KEY);
+    const pData = await fetchJson(pUrl);
+    const playlistItems = pData.items || [];
+
+    if (playlistItems.length === 0) return videos;
+
+    // Batch fetch video details to filter out livestreams + get duration
+    const videoIds = playlistItems.map(pi => pi.contentDetails.videoId).join(",");
+    const vUrl = "https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails,liveStreamingDetails,statistics&id=" + encodeURIComponent(videoIds) + "&key=" + encodeURIComponent(YOUTUBE_API_KEY);
+    const vData = await fetchJson(vUrl);
+    const videoDetails = vData.items || [];
+
+    for (const v of videoDetails) {
+      // Skip livestreams - they go through the streams scan
+      if (v.liveStreamingDetails) continue;
+
+      const thumbs = v.snippet.thumbnails || {};
+      const thumb = (thumbs.maxres && thumbs.maxres.url) || (thumbs.high && thumbs.high.url) || (thumbs.medium && thumbs.medium.url) || "";
+
+      videos.push({
+        videoId: v.id,
+        title: v.snippet.title,
+        publishedAt: v.snippet.publishedAt,
+        thumbnailUrl: thumb,
+        videoUrl: "https://www.youtube.com/watch?v=" + v.id,
+        durationSeconds: parseISO8601Duration(v.contentDetails && v.contentDetails.duration),
+        viewCount: Number((v.statistics && v.statistics.viewCount) || 0),
+      });
+    }
+  } catch (err) {
+    console.error("fetchRecentVideos err:", err.message);
+  }
+  return videos;
+}
+
+// Parse ISO 8601 duration like PT1H23M45S -> seconds
+function parseISO8601Duration(str) {
+  if (!str) return 0;
+  const m = String(str).match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+  if (!m) return 0;
+  return (Number(m[1] || 0) * 3600) + (Number(m[2] || 0) * 60) + Number(m[3] || 0);
+}
+
+async function upsertVideo(v, info) {
+  const existing = await get("SELECT id FROM videos WHERE video_id = ?", [v.videoId]);
+  if (existing) {
+    // Update view count + title in case changed, but keep original published_at
+    await run("UPDATE videos SET title = ?, view_count = ?, thumbnail_url = ? WHERE id = ?", [v.title, v.viewCount, v.thumbnailUrl, existing.id]);
+    return { added: false, updated: true };
+  }
+  await run(
+    "INSERT INTO videos (channel_name, channel_url, channel_avatar, title, video_id, video_url, thumbnail_url, published_at, duration_seconds, view_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    [info.channelName || "", "https://www.youtube.com/channel/" + info.channelId, info.avatarUrl || "", v.title, v.videoId, v.videoUrl, v.thumbnailUrl, v.publishedAt, v.durationSeconds, v.viewCount]
+  );
+  return { added: true, updated: false };
 }
 
 async function scanAllTrackedChannels() {
@@ -446,7 +532,13 @@ app.get("/api/me", async (req, res) => {
   }
 });
 
+// Public registration is DISABLED. Only admins can create users.
 app.post("/api/register", async (req, res) => {
+  return res.status(403).json({ error: "Registration is closed. Ask an admin to create an account for you." });
+});
+
+// Admin-only: create a user
+app.post("/api/admin/users", requireAdmin(async (req, res) => {
   const username = safeString(req.body.username).toLowerCase();
   const password = safeString(req.body.password);
   const channelName = safeString(req.body.channelName);
@@ -459,13 +551,39 @@ app.post("/api/register", async (req, res) => {
   try {
     const hash = await bcrypt.hash(password, 10);
     const out = await run("INSERT INTO users (username, password_hash, channel_name, channel_url) VALUES (?, ?, ?, ?)", [username, hash, channelName, channelUrl]);
-    req.session.userId = out.lastID;
     broadcast();
-    res.json({ ok: true });
+    res.json({ ok: true, id: out.lastID });
   } catch (err) {
     res.status(400).json({ error: "That username is already taken." });
   }
-});
+}));
+
+// Admin-only: list users
+app.get("/api/admin/users", requireAdmin(async (req, res) => {
+  const users = await all("SELECT id, username, channel_name, channel_url, is_admin, created_at FROM users ORDER BY created_at DESC");
+  res.json({ users });
+}));
+
+// Admin-only: delete a user (won't delete admin)
+app.delete("/api/admin/users/:id", requireAdmin(async (req, res) => {
+  const id = Number(req.params.id);
+  const u = await get("SELECT is_admin, username FROM users WHERE id = ?", [id]);
+  if (!u) return res.status(404).json({ error: "User not found." });
+  if (u.is_admin) return res.status(403).json({ error: "Cannot delete admin user." });
+  await run("DELETE FROM users WHERE id = ?", [id]);
+  broadcast();
+  res.json({ ok: true });
+}));
+
+// Admin-only: reset a user's password
+app.post("/api/admin/users/:id/password", requireAdmin(async (req, res) => {
+  const id = Number(req.params.id);
+  const newPass = safeString(req.body.newPassword);
+  if (newPass.length < 6) return res.status(400).json({ error: "Password must be 6+ chars." });
+  const hash = await bcrypt.hash(newPass, 10);
+  await run("UPDATE users SET password_hash = ? WHERE id = ?", [hash, id]);
+  res.json({ ok: true });
+}));
 
 app.post("/api/login", async (req, res) => {
   const username = safeString(req.body.username).toLowerCase();
@@ -642,6 +760,25 @@ app.post("/api/tracked/:id/scan", requireAdmin(async (req, res) => {
   const result = await scanTrackedChannel(ch);
   broadcast();
   res.json({ ok: true, result });
+}));
+
+// Public: get recent videos (last 30 days, with is_new flag for items <12hr old)
+app.get("/api/videos", async (req, res) => {
+  const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  const rows = await all("SELECT * FROM videos WHERE published_at > ? ORDER BY published_at DESC LIMIT 50", [cutoff]);
+  const now = Date.now();
+  const mapped = rows.map(r => {
+    const ageHours = (now - new Date(r.published_at).getTime()) / 3600000;
+    return { ...r, age_hours: ageHours, is_new: ageHours < 12 };
+  });
+  res.json({ videos: mapped });
+});
+
+// Admin: delete a video
+app.delete("/api/videos/:id", requireAdmin(async (req, res) => {
+  await run("DELETE FROM videos WHERE id = ?", [Number(req.params.id)]);
+  broadcast();
+  res.json({ ok: true });
 }));
 
 app.get("/", (req, res) => {
@@ -1321,6 +1458,146 @@ button,input,textarea,select{font:inherit;font-family:'Inter',system-ui,sans-ser
 /* ============ HIDDEN ============ */
 .hidden{display:none!important}
 
+/* ============ VIDEO GRID (uploads) ============ */
+.video-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fill, minmax(260px, 1fr));
+  gap:14px;
+  margin-bottom:8px;
+}
+.video-card{
+  background: linear-gradient(180deg, var(--bg-1) 0%, var(--bg-2) 100%);
+  border:1px solid var(--border);
+  border-radius:12px;
+  overflow:hidden;
+  transition:all .2s;
+  position:relative;
+  text-decoration:none;
+  color:inherit;
+  display:flex;
+  flex-direction:column;
+}
+.video-card:hover{
+  border-color:var(--border-strong);
+  transform:translateY(-2px);
+  box-shadow:0 12px 32px rgba(0,0,0,.5);
+  text-decoration:none;
+}
+.video-card.fresh{
+  border-color: rgba(225,6,0,.4);
+  box-shadow: 0 0 0 1px rgba(225,6,0,.2), 0 8px 24px rgba(225,6,0,.15);
+}
+.video-card.fresh::before{
+  content:'';
+  position:absolute;
+  inset:-1px;
+  border-radius:12px;
+  padding:1px;
+  background: linear-gradient(135deg, var(--red-bright), transparent 40%, transparent 60%, var(--red));
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events:none;
+  opacity:.6;
+}
+.video-thumb{
+  width:100%;
+  aspect-ratio:16/9;
+  background-color:var(--bg-3);
+  background-size:cover;
+  background-position:center;
+  position:relative;
+}
+.video-duration{
+  position:absolute;
+  bottom:6px;right:6px;
+  background:rgba(0,0,0,.85);
+  color:#fff;
+  font-family:'JetBrains Mono',monospace;
+  font-size:11px;
+  padding:2px 6px;
+  border-radius:4px;
+  font-weight:600;
+}
+.video-fresh-tag{
+  position:absolute;
+  top:8px;left:8px;
+  display:inline-flex;align-items:center;gap:5px;
+  background: var(--red);
+  color:#fff;
+  font-size:10px;
+  font-weight:800;
+  letter-spacing:1.5px;
+  padding:4px 9px;
+  border-radius:6px;
+  text-transform:uppercase;
+  box-shadow: 0 0 16px var(--red-glow);
+}
+.video-fresh-tag::before{
+  content:'';
+  width:6px;height:6px;border-radius:50%;
+  background:#fff;
+  animation:pulseDot 1.2s ease-in-out infinite;
+}
+.video-body{
+  padding:12px;
+  flex:1;
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+}
+.video-title{
+  font-size:14px;
+  font-weight:700;
+  color:#fff;
+  line-height:1.3;
+  display:-webkit-box;
+  -webkit-line-clamp:2;
+  -webkit-box-orient:vertical;
+  overflow:hidden;
+}
+.video-channel{
+  font-size:12px;
+  color:var(--text-mute);
+  display:flex;align-items:center;gap:6px;
+}
+.video-channel .av{
+  width:18px;height:18px;
+  border-radius:50%;
+  background-size:cover;
+  background-position:center;
+  background-color:var(--bg-3);
+  flex-shrink:0;
+}
+.video-meta{
+  font-size:11px;
+  color:var(--text-dim);
+  font-family:'JetBrains Mono',monospace;
+  margin-top:auto;
+}
+.section-label.fresh::before{background:var(--red);box-shadow:0 0 12px var(--red-glow)}
+
+/* ============ USERS LIST ============ */
+.user-row{
+  display:flex;align-items:center;gap:12px;
+  background:var(--bg-1);
+  border:1px solid var(--border);
+  border-radius:10px;
+  padding:10px 14px;
+  margin-bottom:8px;
+}
+.user-row .av{
+  width:34px;height:34px;
+  border-radius:50%;
+  background:var(--bg-3);
+  display:flex;align-items:center;justify-content:center;
+  font-size:13px;font-weight:700;color:#fff;
+  flex-shrink:0;
+}
+.user-row-info{flex:1;min-width:0}
+.user-row-name{font-weight:700;color:#fff;font-size:14px}
+.user-row-meta{font-size:11px;color:var(--text-mute);font-family:'JetBrains Mono',monospace}
+
 /* ============ RESPONSIVE ============ */
 @media(max-width:900px){
   .main-grid{grid-template-columns:1fr}
@@ -1348,8 +1625,7 @@ button,input,textarea,select{font:inherit;font-family:'Inter',system-ui,sans-ser
     </span>
     <span id="adminPill" class="admin-pill hidden">⚡ Admin</span>
     <div id="navAuthOut">
-      <button class="btn btn-ghost" onclick="openModal('login')">Log in</button>
-      <button class="btn btn-primary" onclick="openModal('register')">Sign up</button>
+      <button class="btn btn-primary" onclick="openModal('login')">Log in</button>
     </div>
     <div id="navAuthIn" class="dropdown hidden">
       <div class="user-pill" onclick="toggleUserMenu(event)">
@@ -1372,13 +1648,14 @@ button,input,textarea,select{font:inherit;font-family:'Inter',system-ui,sans-ser
   <div class="hero-row">
     <div>
       <h1 class="hero-title">UPCOMING STREAMS</h1>
-      <div class="hero-sub">Live now & coming up · <a onclick="requireLogin(()=>setView('submit'))">+ Add your stream</a></div>
+      <div class="hero-sub" id="heroSub">Live now & coming up</div>
     </div>
     <div id="heroStats" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)"></div>
   </div>
 
   <div class="tabs" id="mainTabs">
     <button class="tab active" data-view="schedule" onclick="setView('schedule')">📅 Schedule</button>
+    <button class="tab" data-view="past" onclick="setView('past')">📼 Past Streams</button>
     <button class="tab hidden" id="tabMine" data-view="mine" onclick="setView('mine')">🎬 My Streams</button>
     <button class="tab hidden" id="tabAdmin" data-view="admin" onclick="setView('admin')">🔐 Admin <span class="badge" id="pendingBadge" style="display:none">0</span></button>
     <button class="tab hidden" id="tabSetup" data-view="setup" onclick="setView('setup')">⚙️ Setup</button>
@@ -1389,12 +1666,27 @@ button,input,textarea,select{font:inherit;font-family:'Inter',system-ui,sans-ser
     <div>
       <!-- SCHEDULE -->
       <div class="view" id="view-schedule">
+        <div id="freshUploadsWrap" class="hidden">
+          <div class="section-label fresh">🔥 Fresh uploads <span style="font-family:Inter;font-size:11px;color:var(--text-dim);font-weight:600;letter-spacing:.5px;margin-left:8px">last 12 hours</span></div>
+          <div class="video-grid" id="freshUploadsList"></div>
+        </div>
         <div class="section-label live">🔴 Live now</div>
         <div class="stream-list" id="liveList"></div>
         <div class="section-label">⏳ Upcoming</div>
         <div class="stream-list" id="upcomingList"></div>
-        <div class="section-label">✅ Recently ended</div>
-        <div class="stream-list" id="endedList"></div>
+        <div id="recentVideosWrap" class="hidden">
+          <div class="section-label">📹 Recent uploads</div>
+          <div class="video-grid" id="recentVideosList"></div>
+        </div>
+      </div>
+
+      <!-- PAST STREAMS -->
+      <div class="view hidden" id="view-past">
+        <div class="panel">
+          <h2 style="font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:2px;margin:0 0 4px">PAST STREAMS</h2>
+          <p style="color:var(--text-mute);margin:0 0 20px;font-size:13px">Streams that have ended.</p>
+          <div class="stream-list" id="pastListFull"></div>
+        </div>
       </div>
 
       <!-- MY STREAMS -->
@@ -1498,6 +1790,15 @@ button,input,textarea,select{font:inherit;font-family:'Inter',system-ui,sans-ser
         </div>
 
         <div class="panel">
+          <h3 style="font-family:'Bebas Neue',sans-serif;font-size:22px;letter-spacing:2px;margin:0 0 6px">USERS</h3>
+          <p style="color:var(--text-mute);margin:0 0 16px;font-size:13px">
+            Public registration is closed. Create accounts for the people you want to give access.
+          </p>
+          <button class="btn btn-primary" onclick="openModal('createUser')">+ Create User</button>
+          <div style="margin-top:18px" id="usersList"></div>
+        </div>
+
+        <div class="panel">
           <h3 style="font-family:'Bebas Neue',sans-serif;font-size:22px;letter-spacing:2px;margin:0 0 6px">CONFIG</h3>
           <p style="color:var(--text-mute);margin:0;font-size:13px">
             Defaults: <code>admin / madrox79</code>. Configure server-side via Railway env vars:<br>
@@ -1512,11 +1813,10 @@ button,input,textarea,select{font:inherit;font-family:'Inter',system-ui,sans-ser
     <!-- SIDEBAR -->
     <aside class="sidebar">
       <div id="sidebarLoggedOut" class="panel">
-        <h3>JOIN STREAMSHED</h3>
-        <p style="color:var(--text-mute);font-size:13px;margin:0 0 16px">Create an account to add your YouTube streams to the schedule.</p>
+        <h3>STREAMSHED</h3>
+        <p style="color:var(--text-mute);font-size:13px;margin:0 0 16px">Log in to manage your streams. New accounts are created by admin invitation only.</p>
         <div style="display:flex;flex-direction:column;gap:8px">
-          <button class="btn btn-primary" onclick="openModal('register')">Sign up</button>
-          <button class="btn btn-ghost" onclick="openModal('login')">Log in</button>
+          <button class="btn btn-primary" onclick="openModal('login')">Log in</button>
         </div>
       </div>
 
@@ -1549,35 +1849,33 @@ button,input,textarea,select{font:inherit;font-family:'Inter',system-ui,sans-ser
         <button type="button" class="btn btn-ghost" onclick="closeModal('login')">Cancel</button>
       </div>
     </form>
-    <div style="text-align:center;font-size:13px;color:var(--text-mute);margin-top:14px">
-      No account? <a onclick="closeModal('login');openModal('register')">Sign up</a>
+    <div style="text-align:center;font-size:12px;color:var(--text-dim);margin-top:14px">
+      Accounts are issued by admin. Contact the site owner to be added.
     </div>
   </div>
 </div>
 
-<!-- REGISTER MODAL -->
-<div class="modal-bg" id="modalRegister">
+<!-- CREATE USER MODAL (admin only) -->
+<div class="modal-bg" id="modalCreateUser">
   <div class="modal">
-    <div class="modal-title">CREATE ACCOUNT</div>
-    <div class="modal-sub">Set up a profile to post streams faster.</div>
-    <form id="registerForm" class="form-grid">
+    <div class="modal-title">CREATE USER</div>
+    <div class="modal-sub">Add a new account for someone you trust.</div>
+    <form id="createUserForm" class="form-grid">
       <div class="form-row">
-        <div><label class="form-label">Username *</label><input class="form-input" id="regUser" required></div>
-        <div><label class="form-label">Password *</label><input type="password" class="form-input" id="regPass" required></div>
+        <div><label class="form-label">Username *</label><input class="form-input" id="cuUser" required></div>
+        <div><label class="form-label">Password *</label><input type="text" class="form-input" id="cuPass" required placeholder="min 6 chars"></div>
       </div>
       <div class="form-row">
-        <div><label class="form-label">Channel Name</label><input class="form-input" id="regChannelName"></div>
-        <div><label class="form-label">Channel URL</label><input class="form-input" id="regChannelUrl" placeholder="https://youtube.com/@you"></div>
+        <div><label class="form-label">Channel Name</label><input class="form-input" id="cuChannelName"></div>
+        <div><label class="form-label">Channel URL</label><input class="form-input" id="cuChannelUrl" placeholder="https://youtube.com/@..."></div>
       </div>
-      <div id="regErr" class="form-error hidden"></div>
+      <div id="cuErr" class="form-error hidden"></div>
+      <div id="cuSuccess" class="form-success hidden"></div>
       <div style="display:flex;gap:8px">
-        <button type="submit" class="btn btn-primary" style="flex:1;padding:12px">Create Account</button>
-        <button type="button" class="btn btn-ghost" onclick="closeModal('register')">Cancel</button>
+        <button type="submit" class="btn btn-primary" style="flex:1;padding:12px">Create</button>
+        <button type="button" class="btn btn-ghost" onclick="closeModal('createUser')">Done</button>
       </div>
     </form>
-    <div style="text-align:center;font-size:13px;color:var(--text-mute);margin-top:14px">
-      Already have one? <a onclick="closeModal('register');openModal('login')">Log in</a>
-    </div>
   </div>
 </div>
 
@@ -1639,6 +1937,8 @@ button,input,textarea,select{font:inherit;font-family:'Inter',system-ui,sans-ser
 <script>
 let me = null;
 let streams = [];
+let videos = [];
+let users = [];
 let trackedChannels = [];
 let lastLookup = null;
 let currentView = 'schedule';
@@ -1711,6 +2011,45 @@ function updateCountdowns() {
   });
 }
 
+function fmtAge(hours) {
+  if (hours < 1) return Math.floor(hours * 60) + 'm ago';
+  if (hours < 24) return Math.floor(hours) + 'h ago';
+  return Math.floor(hours / 24) + 'd ago';
+}
+
+function fmtDuration(secs) {
+  if (!secs) return '';
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = secs % 60;
+  if (h > 0) return h + ':' + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+  return m + ':' + String(s).padStart(2, '0');
+}
+
+function fmtViews(n) {
+  n = Number(n) || 0;
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M views';
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'K views';
+  return n + ' views';
+}
+
+function renderVideoCard(v) {
+  const thumb = v.thumbnail_url || ('https://i.ytimg.com/vi/' + v.video_id + '/hqdefault.jpg');
+  const av = v.channel_avatar ? '<span class="av" style="background-image:url(' + esc(v.channel_avatar) + ')"></span>' : '<span class="av"></span>';
+  const dur = v.duration_seconds ? '<div class="video-duration">' + fmtDuration(v.duration_seconds) + '</div>' : '';
+  const fresh = v.is_new ? '<div class="video-fresh-tag">New</div>' : '';
+  const cls = v.is_new ? 'video-card fresh' : 'video-card';
+  return '' +
+    '<a href="' + esc(v.video_url) + '" target="_blank" rel="noopener" class="' + cls + '">' +
+      '<div class="video-thumb" style="background-image:url(' + esc(thumb) + ')">' + fresh + dur + '</div>' +
+      '<div class="video-body">' +
+        '<div class="video-title">' + esc(v.title) + '</div>' +
+        '<div class="video-channel">' + av + esc(v.channel_name) + '</div>' +
+        '<div class="video-meta">' + esc(fmtAge(v.age_hours)) + ' · ' + esc(fmtViews(v.view_count)) + '</div>' +
+      '</div>' +
+    '</a>';
+}
+
 function renderStream(stream) {
   const status = stream.computed_status || stream.status;
   const link = stream.youtube_video_url || stream.channel_url || '#';
@@ -1778,15 +2117,66 @@ function renderTracked() {
   $('trackedList').innerHTML = html || emptyHtml('No tracked channels yet. Add one above.', '📡');
 }
 
+function renderUsers() {
+  if (!(me && me.is_admin)) return;
+  if (!users || users.length === 0) {
+    $('usersList').innerHTML = emptyHtml('No users yet. Click + Create User to add one.', '👥');
+    return;
+  }
+  $('usersList').innerHTML = users.map(u => {
+    const avInit = String(u.username || '?').substring(0,2).toUpperCase();
+    const isAdmin = u.is_admin ? '<span class="admin-pill" style="margin-left:8px">Admin</span>' : '';
+    const deleteBtn = u.is_admin ? '' : '<button class="btn btn-warn btn-sm" data-action="delete-user" data-id="' + u.id + '" data-name="' + esc(u.username) + '">Delete</button>';
+    const resetBtn = '<button class="btn btn-sm" data-action="reset-password" data-id="' + u.id + '" data-name="' + esc(u.username) + '">Reset password</button>';
+    return '' +
+      '<div class="user-row">' +
+        '<div class="av">' + avInit + '</div>' +
+        '<div class="user-row-info">' +
+          '<div class="user-row-name">' + esc(u.username) + isAdmin + '</div>' +
+          '<div class="user-row-meta">' + esc(u.channel_name || '(no channel)') + ' · created ' + esc(fmtTime(u.created_at)) + '</div>' +
+        '</div>' +
+        resetBtn +
+        deleteBtn +
+      '</div>';
+  }).join('');
+  // Wire up the buttons
+  $('usersList').querySelectorAll('[data-action="delete-user"]').forEach(btn => {
+    btn.addEventListener('click', () => deleteUser(Number(btn.dataset.id), btn.dataset.name));
+  });
+  $('usersList').querySelectorAll('[data-action="reset-password"]').forEach(btn => {
+    btn.addEventListener('click', () => resetUserPassword(Number(btn.dataset.id), btn.dataset.name));
+  });
+}
+
 function render() {
   const approved = streams.filter(s => s.status === 'approved');
   const liveS = approved.filter(s => s.computed_status === 'live');
   const upcomingS = approved.filter(s => s.computed_status === 'upcoming');
-  const endedS = approved.filter(s => s.computed_status === 'ended').slice(-6).reverse();
+  const endedS = approved.filter(s => s.computed_status === 'ended').sort((a,b) => new Date(b.scheduled_at) - new Date(a.scheduled_at));
+
+  // Fresh uploads (last 12 hours)
+  const fresh = videos.filter(v => v.is_new);
+  const recent = videos.filter(v => !v.is_new).slice(0, 12);
+
+  if (fresh.length > 0) {
+    $('freshUploadsWrap').classList.remove('hidden');
+    $('freshUploadsList').innerHTML = fresh.map(renderVideoCard).join('');
+  } else {
+    $('freshUploadsWrap').classList.add('hidden');
+  }
+
+  if (recent.length > 0) {
+    $('recentVideosWrap').classList.remove('hidden');
+    $('recentVideosList').innerHTML = recent.map(renderVideoCard).join('');
+  } else {
+    $('recentVideosWrap').classList.add('hidden');
+  }
 
   $('liveList').innerHTML = liveS.length ? liveS.map(renderStream).join('') : emptyHtml('Nobody is live right now.', '⏸');
   $('upcomingList').innerHTML = upcomingS.length ? upcomingS.map(renderStream).join('') : emptyHtml('No upcoming streams scheduled.', '📅');
-  $('endedList').innerHTML = endedS.length ? endedS.map(renderStream).join('') : emptyHtml('No recent streams.', '✓');
+
+  // Past streams (full view)
+  $('pastListFull').innerHTML = endedS.length ? endedS.map(renderStream).join('') : emptyHtml('No past streams yet.', '📼');
 
   // My streams
   if (me) {
@@ -1803,10 +2193,13 @@ function render() {
     if (pending.length > 0) { pb.style.display = 'inline-flex'; pb.textContent = pending.length; }
     else pb.style.display = 'none';
     renderTracked();
+    renderUsers();
   }
 
   // Hero stats
-  $('heroStats').innerHTML = '<span style="color:var(--green)">● ' + liveS.length + ' live</span> · <span style="color:var(--amber)">' + upcomingS.length + ' upcoming</span>';
+  let stats = '<span style="color:var(--green)">● ' + liveS.length + ' live</span> · <span style="color:var(--amber)">' + upcomingS.length + ' upcoming</span>';
+  if (fresh.length > 0) stats += ' · <span style="color:var(--red-bright)">🔥 ' + fresh.length + ' new</span>';
+  $('heroStats').innerHTML = stats;
 
   updateCountdowns();
 }
@@ -1852,11 +2245,17 @@ async function load() {
     const data = await api('/api/streams');
     streams = data.streams;
 
+    const videosData = await api('/api/videos');
+    videos = videosData.videos || [];
+
     if (me && me.is_admin) {
       const trackedData = await api('/api/tracked');
       trackedChannels = trackedData.channels;
+      const usersData = await api('/api/admin/users');
+      users = usersData.users || [];
     } else {
       trackedChannels = [];
+      users = [];
     }
 
     render();
@@ -1871,7 +2270,8 @@ function setView(view) {
 
   currentView = view;
   document.querySelectorAll('.view').forEach(el => el.classList.add('hidden'));
-  $('view-' + view).classList.remove('hidden');
+  const target = $('view-' + view);
+  if (target) target.classList.remove('hidden');
   document.querySelectorAll('#mainTabs .tab').forEach(t => {
     t.classList.toggle('active', t.dataset.view === view);
   });
@@ -1885,8 +2285,10 @@ function setView(view) {
 function requireLogin(fn) { if (!me) openModal('login'); else fn(); }
 
 function openModal(name) {
-  $('modal' + name.charAt(0).toUpperCase() + name.slice(1)).classList.add('show');
-  ['loginErr','regErr','sErr','eErr','pwErr'].forEach(id => { const el = $(id); if (el) el.classList.add('hidden'); });
+  const id = 'modal' + name.charAt(0).toUpperCase() + name.slice(1);
+  const el = $(id);
+  if (el) el.classList.add('show');
+  ['loginErr','sErr','eErr','pwErr','cuErr'].forEach(id => { const el = $(id); if (el) el.classList.add('hidden'); });
 }
 function closeModal(name) {
   $('modal' + name.charAt(0).toUpperCase() + name.slice(1)).classList.remove('show');
@@ -1950,15 +2352,37 @@ $('loginForm').addEventListener('submit', async e => {
   } catch (err) { $('loginErr').textContent = err.message; $('loginErr').classList.remove('hidden'); }
 });
 
-$('registerForm').addEventListener('submit', async e => {
+// Admin: create user
+$('createUserForm').addEventListener('submit', async e => {
   e.preventDefault();
   try {
-    await api('/api/register', { method: 'POST', body: JSON.stringify({ username: $('regUser').value, password: $('regPass').value, channelName: $('regChannelName').value, channelUrl: $('regChannelUrl').value }) });
-    closeModal('register');
-    toast('Account created!', 'success');
+    await api('/api/admin/users', { method: 'POST', body: JSON.stringify({
+      username: $('cuUser').value,
+      password: $('cuPass').value,
+      channelName: $('cuChannelName').value,
+      channelUrl: $('cuChannelUrl').value,
+    }) });
+    $('cuSuccess').textContent = 'Created ' + $('cuUser').value;
+    $('cuSuccess').classList.remove('hidden');
+    setTimeout(() => $('cuSuccess').classList.add('hidden'), 3000);
+    e.target.reset();
     load();
-  } catch (err) { $('regErr').textContent = err.message; $('regErr').classList.remove('hidden'); }
+  } catch (err) { $('cuErr').textContent = err.message; $('cuErr').classList.remove('hidden'); }
 });
+
+async function deleteUser(id, name) {
+  if (!confirm('Delete user "' + name + '"? Their submitted streams will remain but lose ownership.')) return;
+  try { await api('/api/admin/users/' + id, { method: 'DELETE' }); toast('User deleted', 'success'); load(); }
+  catch (err) { toast(err.message, 'error'); }
+}
+
+async function resetUserPassword(id, name) {
+  const newPass = prompt('New password for ' + name + ' (6+ chars):');
+  if (!newPass) return;
+  if (newPass.length < 6) return toast('Too short', 'error');
+  try { await api('/api/admin/users/' + id + '/password', { method: 'POST', body: JSON.stringify({ newPassword: newPass }) }); toast('Password reset', 'success'); }
+  catch (err) { toast(err.message, 'error'); }
+}
 
 $('profileForm').addEventListener('submit', async e => {
   e.preventDefault();
